@@ -1,40 +1,44 @@
 import { Octokit } from '@octokit/rest'
-import OpenAI from 'openai'
 
-// Simple in-memory rate limit (resets on cold start, good enough for free tier)
-const usageMap = new Map()
-const FREE_LIMIT = 5 // generations per day per IP
-const PRO_LIMIT = 100
-
-function getUsageKey(ip) {
-  const today = new Date().toISOString().split('T')[0]
-  return `${ip}:${today}`
+// Categorize a commit message
+function categorize(msg) {
+  const m = msg.toLowerCase()
+  if (m.startsWith('feat') || m.includes('add ') || m.includes('new ') || m.includes('implement') || m.includes('support')) return '✨ Features'
+  if (m.startsWith('fix') || m.includes('bug') || m.includes('patch') || m.includes('resolve') || m.includes('crash')) return '🐛 Bug Fixes'
+  if (m.startsWith('doc') || m.includes('readme') || m.includes('changelog') || m.includes('comment')) return '📝 Documentation'
+  if (m.startsWith('refactor') || m.startsWith('chore') || m.includes('cleanup') || m.includes('lint') || m.includes('format')) return '🏗️ Internal'
+  if (m.startsWith('perf') || m.includes('optim') || m.includes('speed') || m.includes('improv')) return '⚡ Performance'
+  if (m.startsWith('test') || m.includes('test')) return '🧪 Tests'
+  if (m.startsWith('ci') || m.includes('deploy') || m.includes('pipeline') || m.includes('workflow')) return '🔧 CI/CD'
+  if (m.startsWith('style') || m.includes('css') || m.includes('ui ') || m.includes('design')) return '🎨 Styling'
+  return '🔧 Improvements'
 }
 
-function checkRateLimit(ip, isPro) {
-  const key = getUsageKey(ip)
-  const count = usageMap.get(key) || 0
-  const limit = isPro ? PRO_LIMIT : FREE_LIMIT
-  if (count >= limit) return false
-  usageMap.set(key, count + 1)
-  return true
+// Clean up a commit message for display
+function cleanMessage(msg) {
+  // Remove conventional commit prefix
+  return msg
+    .replace(/^(feat|fix|docs|chore|refactor|perf|test|ci|style|build)(\(.+?\))?[!]?:\s*/i, '')
+    .replace(/^\[.+?\]\s*/, '')
+    .trim()
+}
+
+function isSkippable(msg) {
+  const m = msg.toLowerCase()
+  return (
+    m.startsWith('merge ') ||
+    m.startsWith('merged ') ||
+    m === 'initial commit' ||
+    m.startsWith('wip') ||
+    m.match(/^bump.+version/) ||
+    m.length < 5
+  )
 }
 
 export async function POST(req) {
   try {
-    const ip = req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || 'unknown'
-    const { repo, apiKey } = await req.json()
-    
-    // Pro users can bring their own OpenAI key
-    const isPro = !!apiKey
-    
-    if (!checkRateLimit(ip, isPro)) {
-      return Response.json({ 
-        error: `Daily limit reached (${FREE_LIMIT}/day). Upgrade to Pro for ${PRO_LIMIT}/day, or bring your own OpenAI API key.`,
-        upgrade: true
-      }, { status: 429 })
-    }
-    
+    const { repo } = await req.json()
+
     if (!repo || !repo.includes('/')) {
       return Response.json({ error: 'Please enter a valid repo (owner/repo)' }, { status: 400 })
     }
@@ -42,14 +46,10 @@ export async function POST(req) {
     const [owner, name] = repo.split('/')
     const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN })
 
-    // Get recent commits (last 50)
+    // Get recent commits
     let commits
     try {
-      const res = await octokit.repos.listCommits({
-        owner,
-        repo: name,
-        per_page: 50,
-      })
+      const res = await octokit.repos.listCommits({ owner, repo: name, per_page: 60 })
       commits = res.data
     } catch (e) {
       return Response.json({ error: 'Repo not found or not accessible.' }, { status: 404 })
@@ -59,72 +59,91 @@ export async function POST(req) {
       return Response.json({ error: 'No commits found in this repo.' }, { status: 404 })
     }
 
-    // Get recent tags for version context
-    let tags = []
+    // Get tags for version
+    let latestTag = 'Unreleased'
     try {
-      const tagRes = await octokit.repos.listTags({ owner, repo: name, per_page: 5 })
-      tags = tagRes.data.map(t => t.name)
+      const tagRes = await octokit.repos.listTags({ owner, repo: name, per_page: 1 })
+      if (tagRes.data.length) latestTag = tagRes.data[0].name
     } catch (e) {}
 
-    // Get recent PRs merged
-    let prs = []
+    // Get merged PRs
+    let prMap = {}
     try {
       const prRes = await octokit.pulls.list({
-        owner,
-        repo: name,
-        state: 'closed',
-        sort: 'updated',
-        direction: 'desc',
-        per_page: 20,
+        owner, repo: name, state: 'closed', sort: 'updated', direction: 'desc', per_page: 30,
       })
-      prs = prRes.data
-        .filter(pr => pr.merged_at)
-        .map(pr => `- PR #${pr.number}: ${pr.title}`)
-        .slice(0, 15)
+      prRes.data.filter(pr => pr.merged_at).forEach(pr => {
+        prMap[pr.merge_commit_sha] = `${pr.title} (#${pr.number})`
+      })
     } catch (e) {}
 
-    // Format commits for the AI
-    const commitList = commits.map(c => {
-      const msg = c.commit.message.split('\n')[0]
-      const date = c.commit.author?.date?.split('T')[0] || ''
-      const author = c.commit.author?.name || 'unknown'
-      return `- [${date}] ${msg} (${author})`
-    }).join('\n')
+    // Process commits
+    const categories = {}
+    const dateRange = {
+      from: commits[commits.length - 1].commit.author?.date?.split('T')[0],
+      to: commits[0].commit.author?.date?.split('T')[0],
+    }
 
-    const prompt = `You are a changelog generator. Given these recent git commits and merged PRs from the repo "${repo}", generate a clean, professional changelog in Markdown format.
+    for (const c of commits) {
+      const rawMsg = c.commit.message.split('\n')[0]
+      
+      // Use PR title if this is a merge commit with a linked PR
+      const msg = prMap[c.sha] || rawMsg
+      
+      if (isSkippable(msg)) continue
 
-Rules:
-- Group changes into categories: ✨ Features, 🐛 Bug Fixes, 🔧 Improvements, 📝 Documentation, 🏗️ Internal
-- Write human-readable summaries (don't just copy commit messages)
-- Combine related commits into single entries
-- Skip merge commits and trivial changes
-- Use the most recent tag as the version header if available, otherwise use "Unreleased"
-- Be concise but informative
-- Add a date range at the top
+      const category = categorize(msg)
+      const cleaned = cleanMessage(msg)
+      const author = c.commit.author?.name || c.author?.login || 'unknown'
 
-Recent tags: ${tags.join(', ') || 'none'}
+      if (!categories[category]) categories[category] = []
+      
+      // Deduplicate
+      const exists = categories[category].some(e => e.text === cleaned)
+      if (!exists) {
+        categories[category].push({ text: cleaned, author })
+      }
+    }
 
-Recent merged PRs:
-${prs.join('\n') || 'none'}
-
-Recent commits:
-${commitList}
-
-Generate the changelog:`
-
-    const openai = new OpenAI({ apiKey: apiKey || process.env.OPENAI_API_KEY })
+    // Build changelog
+    const order = ['✨ Features', '🐛 Bug Fixes', '⚡ Performance', '🔧 Improvements', '🎨 Styling', '📝 Documentation', '🧪 Tests', '🔧 CI/CD', '🏗️ Internal']
     
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 2000,
-      temperature: 0.3,
-    })
+    let changelog = `# ${latestTag}\n\n`
+    changelog += `> ${dateRange.from} — ${dateRange.to}\n\n`
 
-    const changelog = completion.choices[0]?.message?.content || 'Failed to generate changelog.'
-    const remaining = (isPro ? PRO_LIMIT : FREE_LIMIT) - (usageMap.get(getUsageKey(ip)) || 0)
+    for (const cat of order) {
+      if (!categories[cat] || !categories[cat].length) continue
+      changelog += `## ${cat}\n\n`
+      for (const entry of categories[cat]) {
+        changelog += `- ${entry.text}\n`
+      }
+      changelog += '\n'
+    }
 
-    return Response.json({ changelog, remaining })
+    // If OpenAI key is available, enhance with AI
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        const { default: OpenAI } = await import('openai')
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+        
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{
+            role: 'user',
+            content: `Polish this changelog. Make descriptions clearer and more professional. Keep the same structure and emojis. Be concise.\n\n${changelog}`
+          }],
+          max_tokens: 2000,
+          temperature: 0.3,
+        })
+        
+        const enhanced = completion.choices[0]?.message?.content
+        if (enhanced) return Response.json({ changelog: enhanced, enhanced: true })
+      } catch (e) {
+        // Fall through to rule-based version
+      }
+    }
+
+    return Response.json({ changelog, enhanced: false })
   } catch (e) {
     console.error(e)
     return Response.json({ error: 'Internal error. Try again.' }, { status: 500 })
