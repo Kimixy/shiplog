@@ -1,9 +1,39 @@
 import { Octokit } from '@octokit/rest'
 import OpenAI from 'openai'
 
+// Simple in-memory rate limit (resets on cold start, good enough for free tier)
+const usageMap = new Map()
+const FREE_LIMIT = 5 // generations per day per IP
+const PRO_LIMIT = 100
+
+function getUsageKey(ip) {
+  const today = new Date().toISOString().split('T')[0]
+  return `${ip}:${today}`
+}
+
+function checkRateLimit(ip, isPro) {
+  const key = getUsageKey(ip)
+  const count = usageMap.get(key) || 0
+  const limit = isPro ? PRO_LIMIT : FREE_LIMIT
+  if (count >= limit) return false
+  usageMap.set(key, count + 1)
+  return true
+}
+
 export async function POST(req) {
   try {
-    const { repo } = await req.json()
+    const ip = req.headers.get('x-forwarded-for') || req.headers.get('x-real-ip') || 'unknown'
+    const { repo, apiKey } = await req.json()
+    
+    // Pro users can bring their own OpenAI key
+    const isPro = !!apiKey
+    
+    if (!checkRateLimit(ip, isPro)) {
+      return Response.json({ 
+        error: `Daily limit reached (${FREE_LIMIT}/day). Upgrade to Pro for ${PRO_LIMIT}/day, or bring your own OpenAI API key.`,
+        upgrade: true
+      }, { status: 429 })
+    }
     
     if (!repo || !repo.includes('/')) {
       return Response.json({ error: 'Please enter a valid repo (owner/repo)' }, { status: 400 })
@@ -82,7 +112,7 @@ ${commitList}
 
 Generate the changelog:`
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    const openai = new OpenAI({ apiKey: apiKey || process.env.OPENAI_API_KEY })
     
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -92,8 +122,9 @@ Generate the changelog:`
     })
 
     const changelog = completion.choices[0]?.message?.content || 'Failed to generate changelog.'
+    const remaining = (isPro ? PRO_LIMIT : FREE_LIMIT) - (usageMap.get(getUsageKey(ip)) || 0)
 
-    return Response.json({ changelog })
+    return Response.json({ changelog, remaining })
   } catch (e) {
     console.error(e)
     return Response.json({ error: 'Internal error. Try again.' }, { status: 500 })
